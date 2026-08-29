@@ -3,7 +3,7 @@ My learning journey through Linux, the command line, shell scripting, and system
 
 This repository documents my journey of learning Linux and the Command Line, from basic terminal usage to shell scripting and system fundamentals.
 
-🎯 Goal
+## Goal
 
 To develop practical Linux and command-line skills for programming, system administration, cybersecurity, cloud computing, and software development.
 
