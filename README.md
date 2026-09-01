@@ -89,7 +89,7 @@ Logs & Scheduling
 
 Security Fundamentals
 
-# Day 01: Linux Fundamentals
+# Day 00: Linux Fundamentals
 
 ## Objective
 
@@ -150,9 +150,3 @@ These fundamentals provide the foundation for working with Linux systems, comman
 ## Learning Approach
 
 Linux will be covered gradually, starting with the command line and filesystem before progressing toward permissions, processes, networking, shell scripting, system administration, automation, security, services, containers, and advanced Linux concepts.
-
-## Day 01 Completed
-
-**Focus:** Introduction to Linux and the Command Line
-
-**Next:** Continue with the next concepts in Linux.
