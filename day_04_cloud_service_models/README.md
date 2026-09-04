@@ -1,4 +1,3 @@
-```python
 """
 CLOUD SERVICE MODELS
 ====================
@@ -3470,6 +3469,5 @@ The defining characteristic of cloud service models is therefore the **division 
 
 The selected service model determines the level of infrastructure control, operational workload, customization, security responsibility, deployment model, scalability behavior, cost characteristics, and provider dependency associated with a workload.
 
-```
 ```
 
