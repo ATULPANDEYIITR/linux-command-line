@@ -1,382 +1,404 @@
-#!/usr/bin/env python3
+'use strict';
 
-from __future__ import annotations
+const crypto = require('node:crypto');
+const { EventEmitter } = require('node:events');
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
-import copy
-import hashlib
-import json
-import time
+const RecoveryTier = Object.freeze({
+  BACKUP_RESTORE: 'backup_restore',
+  PILOT_LIGHT: 'pilot_light',
+  WARM_STANDBY: 'warm_standby',
+  MULTI_REGION: 'multi_region'
+});
 
+const RegionState = Object.freeze({
+  PRIMARY: 'primary',
+  SECONDARY: 'secondary',
+  FAILED: 'failed'
+});
 
-class RecoveryTier(Enum):
-    BACKUP_RESTORE = "backup_restore"
-    PILOT_LIGHT = "pilot_light"
-    WARM_STANDBY = "warm_standby"
-    MULTI_REGION = "multi_region"
+class RecoveryError extends Error {}
 
+class RecoveryPolicy {
+  constructor({ rpoMinutes, rtoMinutes, requiredApprovals = 1 }) {
+    if (!Number.isInteger(rpoMinutes) || rpoMinutes < 0) {
+      throw new TypeError('RPO must be a non-negative integer');
+    }
 
-class RegionState(Enum):
-    PRIMARY = "primary"
-    SECONDARY = "secondary"
-    FAILED = "failed"
+    if (!Number.isInteger(rtoMinutes) || rtoMinutes <= 0) {
+      throw new TypeError('RTO must be a positive integer');
+    }
 
+    if (!Number.isInteger(requiredApprovals) || requiredApprovals < 1) {
+      throw new TypeError('requiredApprovals must be positive');
+    }
 
-@dataclass(frozen=True)
-class RecoveryObjective:
-    rpo_minutes: int
-    rto_minutes: int
+    this.rpoMinutes = rpoMinutes;
+    this.rtoMinutes = rtoMinutes;
+    this.requiredApprovals = requiredApprovals;
+  }
+}
 
-    def validate(self) -> None:
-        if self.rpo_minutes < 0:
-            raise ValueError("RPO cannot be negative")
-        if self.rto_minutes <= 0:
-            raise ValueError("RTO must be greater than zero")
+class Backup {
+  constructor({ id, service, createdAt, payload, location }) {
+    this.id = id;
+    this.service = service;
+    this.createdAt = createdAt;
+    this.location = location;
+    this.payloadHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(payload))
+      .digest('hex');
+  }
 
+  ageMinutes(now = Date.now()) {
+    return Math.max(0, (now - this.createdAt) / 60000);
+  }
+}
 
-@dataclass
-class Backup:
-    backup_id: str
-    created_at: float
-    size_mb: int
-    checksum: str
-    location: str
-    complete: bool = True
+class Region {
+  constructor(name, state = RegionState.SECONDARY, capacity = 100) {
+    if (!name || capacity < 0 || capacity > 100) {
+      throw new TypeError('Invalid region configuration');
+    }
 
-    @classmethod
-    def create(cls, backup_id: str, data: bytes, location: str) -> "Backup":
-        return cls(
-            backup_id=backup_id,
-            created_at=time.time(),
-            size_mb=max(1, len(data) // 1024 // 1024),
-            checksum=hashlib.sha256(data).hexdigest(),
-            location=location,
-        )
+    this.name = name;
+    this.state = state;
+    this.capacity = capacity;
+  }
 
+  isAvailable() {
+    return this.state !== RegionState.FAILED && this.capacity > 0;
+  }
+}
 
-@dataclass
-class Service:
-    name: str
-    objective: RecoveryObjective
-    tier: RecoveryTier
-    data: Dict[str, str] = field(default_factory=dict)
-    last_backup_at: Optional[float] = None
-    running_regions: List[str] = field(default_factory=list)
+class Service {
+  constructor({ name, policy, tier, regions }) {
+    if (!name || !Object.values(RecoveryTier).includes(tier)) {
+      throw new TypeError('Invalid service definition');
+    }
 
-    def validate(self) -> None:
-        self.objective.validate()
-        if not self.name.strip():
-            raise ValueError("Service name cannot be empty")
-        if not self.running_regions:
-            raise ValueError(f"{self.name} has no recovery region")
+    if (!Array.isArray(regions) || regions.length === 0) {
+      throw new TypeError('A service requires at least one recovery region');
+    }
 
+    this.name = name;
+    this.policy = policy;
+    this.tier = tier;
+    this.regions = new Set(regions);
+    this.data = new Map();
+    this.backups = [];
+  }
 
-@dataclass
-class Region:
-    name: str
-    state: RegionState = RegionState.SECONDARY
-    capacity_percent: int = 100
+  write(key, value) {
+    if (!key || typeof value !== 'string') {
+      throw new TypeError('Invalid service data');
+    }
 
-    def validate(self) -> None:
-        if not 0 <= self.capacity_percent <= 100:
-            raise ValueError("Capacity must be between 0 and 100")
+    this.data.set(key, value);
+  }
 
+  createBackup(location = 'secondary-object-storage') {
+    const payload = Object.fromEntries(this.data.entries());
 
-class RecoveryManager:
-    def __init__(self) -> None:
-        self.regions: Dict[str, Region] = {}
-        self.services: Dict[str, Service] = {}
-        self.backups: Dict[str, List[Backup]] = {}
+    const backup = new Backup({
+      id: `${this.name}-backup-${this.backups.length + 1}`,
+      service: this.name,
+      createdAt: Date.now(),
+      payload,
+      location
+    });
 
-    def add_region(self, region: Region) -> None:
-        region.validate()
-        if region.name in self.regions:
-            raise ValueError(f"Region already exists: {region.name}")
-        self.regions[region.name] = region
+    this.backups.push(backup);
+    return backup;
+  }
 
-    def register_service(self, service: Service) -> None:
-        service.validate()
+  latestBackup() {
+    return this.backups.at(-1) ?? null;
+  }
+}
 
-        missing = [
-            region for region in service.running_regions
-            if region not in self.regions
-        ]
-        if missing:
-            raise ValueError(f"Unknown recovery regions: {missing}")
+class RecoveryController extends EventEmitter {
+  constructor() {
+    super();
+    this.regions = new Map();
+    this.services = new Map();
+  }
 
-        self.services[service.name] = service
-        self.backups.setdefault(service.name, [])
+  addRegion(region) {
+    if (this.regions.has(region.name)) {
+      throw new RecoveryError(`Region already exists: ${region.name}`);
+    }
 
-    def create_backup(self, service_name: str) -> Backup:
-        service = self._service(service_name)
+    this.regions.set(region.name, region);
+  }
 
-        serialized = json.dumps(
-            service.data,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+  addService(service) {
+    for (const region of service.regions) {
+      if (!this.regions.has(region)) {
+        throw new RecoveryError(
+          `Service ${service.name} references unknown region ${region}`
+        );
+      }
+    }
 
-        backup_id = f"{service_name}-backup-{len(self.backups[service_name]) + 1}"
-        backup = Backup.create(
-            backup_id=backup_id,
-            data=serialized,
-            location="object-storage-secondary",
-        )
+    this.services.set(service.name, service);
+  }
 
-        self.backups[service_name].append(backup)
-        service.last_backup_at = backup.created_at
-        return backup
+  failRegion(regionName) {
+    const region = this.getRegion(regionName);
+    region.state = RegionState.FAILED;
 
-    def record_write(self, service_name: str, key: str, value: str) -> None:
-        service = self._service(service_name)
-        if not key:
-            raise ValueError("Data key cannot be empty")
-        service.data[key] = value
+    this.emit('regionFailed', {
+      region: regionName,
+      timestamp: new Date().toISOString()
+    });
+  }
 
-    def latest_backup(self, service_name: str) -> Optional[Backup]:
-        backups = self.backups.get(service_name, [])
-        return backups[-1] if backups else None
+  evaluate(serviceName, failedRegion, targetRegion) {
+    const service = this.getService(serviceName);
+    const failed = this.getRegion(failedRegion);
+    const target = this.getRegion(targetRegion);
 
-    def calculate_data_loss_minutes(
-        self,
-        service_name: str,
-        failure_time: Optional[float] = None,
-    ) -> Optional[float]:
-        backup = self.latest_backup(service_name)
-        if backup is None:
-            return None
+    const backup = service.latestBackup();
 
-        failure_time = failure_time or time.time()
-        return max(0.0, (failure_time - backup.created_at) / 60)
+    const checks = {
+      targetConfigured: service.regions.has(targetRegion),
+      targetAvailable: target.isAvailable(),
+      failed: failed.state === RegionState.FAILED,
+      backupAvailable: backup !== null,
+      rpoMet: false,
+      rtoMet: false,
+      tierSupported: false
+    };
 
-    def fail_region(self, region_name: str) -> None:
-        region = self._region(region_name)
-        region.state = RegionState.FAILED
+    const recoveryMinutes = {
+      [RecoveryTier.BACKUP_RESTORE]: 90,
+      [RecoveryTier.PILOT_LIGHT]: 30,
+      [RecoveryTier.WARM_STANDBY]: 10,
+      [RecoveryTier.MULTI_REGION]: 2
+    }[service.tier];
 
-    def recover(
-        self,
-        service_name: str,
-        failed_region: str,
-        available_recovery_region: str,
-    ) -> Dict[str, object]:
-        service = self._service(service_name)
-        failed = self._region(failed_region)
-        target = self._region(available_recovery_region)
+    checks.rtoMet = recoveryMinutes <= service.policy.rtoMinutes;
 
-        if failed.state != RegionState.FAILED:
-            raise RuntimeError(f"Region {failed_region} is not failed")
+    if (backup) {
+      checks.rpoMet =
+        backup.ageMinutes() <= service.policy.rpoMinutes;
+    }
 
-        if target.state == RegionState.FAILED:
-            raise RuntimeError(f"Recovery target {target.name} is unavailable")
+    checks.tierSupported =
+      service.tier === RecoveryTier.BACKUP_RESTORE
+        ? checks.backupAvailable
+        : checks.targetConfigured;
 
-        if target.capacity_percent <= 0:
-            raise RuntimeError(f"Recovery target {target.name} has no capacity")
+    const eligible = Object.values(checks).every(Boolean);
 
-        backup = self.latest_backup(service_name)
+    return {
+      service: service.name,
+      failedRegion,
+      targetRegion,
+      tier: service.tier,
+      checks,
+      recoveryMinutes,
+      backupAgeMinutes: backup
+        ? Number(backup.ageMinutes().toFixed(2))
+        : null,
+      eligible
+    };
+  }
 
-        if service.tier == RecoveryTier.BACKUP_RESTORE and backup is None:
-            raise RuntimeError("Backup restore is impossible without a backup")
+  recover(serviceName, failedRegion, targetRegion) {
+    const evaluation = this.evaluate(
+      serviceName,
+      failedRegion,
+      targetRegion
+    );
 
-        if service.tier in {
-            RecoveryTier.PILOT_LIGHT,
-            RecoveryTier.WARM_STANDBY,
-            RecoveryTier.MULTI_REGION,
-        } and target.name not in service.running_regions:
-            raise RuntimeError(
-                f"{target.name} is not configured for service {service_name}"
-            )
+    if (!evaluation.eligible) {
+      throw new RecoveryError(
+        `Recovery rejected: ${JSON.stringify(evaluation.checks)}`
+      );
+    }
 
-        estimated_minutes = {
-            RecoveryTier.BACKUP_RESTORE: 90,
-            RecoveryTier.PILOT_LIGHT: 30,
-            RecoveryTier.WARM_STANDBY: 10,
-            RecoveryTier.MULTI_REGION: 2,
-        }[service.tier]
+    this.getRegion(targetRegion).state = RegionState.PRIMARY;
 
-        meets_rto = estimated_minutes <= service.objective.rto_minutes
-        estimated_rpo = self.calculate_data_loss_minutes(service_name)
+    this.emit('failoverCompleted', {
+      service: serviceName,
+      from: failedRegion,
+      to: targetRegion,
+      at: new Date().toISOString()
+    });
 
-        meets_rpo = (
-            estimated_rpo is not None
-            and estimated_rpo <= service.objective.rpo_minutes
-        )
+    return evaluation;
+  }
 
-        if not meets_rto or not meets_rpo:
-            raise RuntimeError(
-                f"Recovery objectives violated: "
-                f"RPO={estimated_rpo}, target={service.objective.rpo_minutes}; "
-                f"RTO={estimated_minutes}, target={service.objective.rto_minutes}"
-            )
+  audit() {
+    const findings = [];
 
-        target.state = RegionState.PRIMARY
-        failed.state = RegionState.FAILED
+    for (const service of this.services.values()) {
+      const backup = service.latestBackup();
 
-        return {
-            "service": service.name,
-            "tier": service.tier.value,
-            "recovery_region": target.name,
-            "estimated_rpo_minutes": round(estimated_rpo or 0, 2),
-            "estimated_rto_minutes": estimated_minutes,
-            "rpo_met": meets_rpo,
-            "rto_met": meets_rto,
+      if (!backup) {
+        findings.push(`${service.name}: no backup`);
+        continue;
+      }
+
+      if (backup.ageMinutes() > service.policy.rpoMinutes) {
+        findings.push(
+          `${service.name}: backup age exceeds RPO`
+        );
+      }
+
+      if (service.tier === RecoveryTier.MULTI_REGION) {
+        const available = [...service.regions]
+          .map(name => this.getRegion(name))
+          .filter(region => region.isAvailable());
+
+        if (available.length < 2) {
+          findings.push(
+            `${service.name}: insufficient available regions`
+          );
         }
+      }
+    }
 
-    def audit(self) -> List[str]:
-        findings: List[str] = []
+    return findings;
+  }
 
-        for service in self.services.values():
-            latest = self.latest_backup(service.name)
+  getService(name) {
+    const service = this.services.get(name);
+    if (!service) {
+      throw new RecoveryError(`Unknown service: ${name}`);
+    }
+    return service;
+  }
 
-            if latest is None:
-                findings.append(f"{service.name}: no backup exists")
-                continue
+  getRegion(name) {
+    const region = this.regions.get(name);
+    if (!region) {
+      throw new RecoveryError(`Unknown region: ${name}`);
+    }
+    return region;
+  }
+}
 
-            if not latest.complete:
-                findings.append(f"{service.name}: latest backup is incomplete")
+async function waitForHealthCheck(region) {
+  // Event-driven recovery systems normally wait for an external health signal.
+  // This deterministic simulation uses a short asynchronous delay.
+  await new Promise(resolve => setTimeout(resolve, 25));
+  return region.isAvailable();
+}
 
-            age_minutes = (time.time() - latest.created_at) / 60
+async function main() {
+  const controller = new RecoveryController();
 
-            if age_minutes > service.objective.rpo_minutes:
-                findings.append(
-                    f"{service.name}: backup age exceeds RPO "
-                    f"({age_minutes:.1f} > {service.objective.rpo_minutes} minutes)"
-                )
+  controller.on('regionFailed', event => {
+    console.log(`EVENT regionFailed: ${event.region}`);
+  });
 
-            if service.tier == RecoveryTier.MULTI_REGION:
-                available = [
-                    self.regions[r]
-                    for r in service.running_regions
-                    if self.regions[r].state != RegionState.FAILED
-                ]
-                if len(available) < 2:
-                    findings.append(
-                        f"{service.name}: multi-region service lacks "
-                        "two available regions"
-                    )
+  controller.on('failoverCompleted', event => {
+    console.log(
+      `EVENT failoverCompleted: ${event.service} ${event.from} -> ${event.to}`
+    );
+  });
 
-        return findings
+  controller.addRegion(
+    new Region('ap-south-1', RegionState.PRIMARY)
+  );
+  controller.addRegion(
+    new Region('ap-southeast-1', RegionState.SECONDARY)
+  );
+  controller.addRegion(
+    new Region('eu-west-1', RegionState.PRIMARY)
+  );
+  controller.addRegion(
+    new Region('eu-central-1', RegionState.SECONDARY)
+  );
 
-    def _service(self, name: str) -> Service:
-        if name not in self.services:
-            raise KeyError(f"Unknown service: {name}")
-        return self.services[name]
+  const payments = new Service({
+    name: 'payments',
+    policy: new RecoveryPolicy({
+      rpoMinutes: 5,
+      rtoMinutes: 15
+    }),
+    tier: RecoveryTier.WARM_STANDBY,
+    regions: ['ap-south-1', 'ap-southeast-1']
+  });
 
-    def _region(self, name: str) -> Region:
-        if name not in self.regions:
-            raise KeyError(f"Unknown region: {name}")
-        return self.regions[name]
+  payments.write('transaction-1001', 'approved');
+  payments.createBackup();
 
+  const analytics = new Service({
+    name: 'analytics',
+    policy: new RecoveryPolicy({
+      rpoMinutes: 30,
+      rtoMinutes: 60
+    }),
+    tier: RecoveryTier.BACKUP_RESTORE,
+    regions: ['eu-west-1', 'eu-central-1']
+  });
 
-def simulate_failover(manager: RecoveryManager) -> None:
-    service = manager.services["payments"]
+  analytics.write('report-2026-10-21', 'complete');
+  const analyticsBackup = analytics.createBackup();
 
-    # Make the backup timestamp recent enough to satisfy the five-minute RPO.
-    backup = manager.create_backup(service.name)
-    backup.created_at = time.time() - 60
-    service.last_backup_at = backup.created_at
+  // Simulate an old backup so the RPO rule fails.
+  analyticsBackup.createdAt = Date.now() - 45 * 60000;
 
-    manager.fail_region("ap-south-1")
+  controller.addService(payments);
+  controller.addService(analytics);
 
-    result = manager.recover(
-        service_name="payments",
-        failed_region="ap-south-1",
-        available_recovery_region="ap-southeast-1",
-    )
+  const target = controller.getRegion('ap-southeast-1');
+  console.log(
+    `Target health: ${await waitForHealthCheck(target)}`
+  );
 
-    print("Recovery result:")
-    print(json.dumps(result, indent=2))
+  controller.failRegion('ap-south-1');
 
-    print("\nAudit findings:")
-    findings = manager.audit()
-    if findings:
-        for finding in findings:
-            print("-", finding)
-    else:
-        print("- No recovery-policy findings")
+  try {
+    const result = controller.recover(
+      'payments',
+      'ap-south-1',
+      'ap-southeast-1'
+    );
 
+    console.log(
+      JSON.stringify(result, null, 2)
+    );
+  } catch (error) {
+    console.error(`Unexpected recovery failure: ${error.message}`);
+  }
 
-def demonstrate_failed_recovery(manager: RecoveryManager) -> None:
-    service = manager.services["analytics"]
+  controller.failRegion('eu-west-1');
 
-    # A stale backup intentionally demonstrates an RPO failure.
-    backup = manager.create_backup(service.name)
-    backup.created_at = time.time() - 180
-    service.last_backup_at = backup.created_at
+  try {
+    controller.recover(
+      'analytics',
+      'eu-west-1',
+      'eu-central-1'
+    );
+  } catch (error) {
+    console.log(`Expected rejection: ${error.message}`);
+  }
 
-    manager.fail_region("eu-west-1")
+  console.log('\nRecovery audit:');
+  console.log(controller.audit());
 
-    try:
-        manager.recover(
-            service_name="analytics",
-            failed_region="eu-west-1",
-            available_recovery_region="eu-central-1",
-        )
-    except RuntimeError as exc:
-        print("\nExpected recovery rejection:")
-        print(exc)
+  // A target with zero capacity must never be selected for failover.
+  controller.getRegion('ap-southeast-1').capacity = 0;
 
+  try {
+    controller.recover(
+      'payments',
+      'ap-south-1',
+      'ap-southeast-1'
+    );
+  } catch (error) {
+    console.log(
+      `Expected capacity rejection: ${error.message}`
+    );
+  }
+}
 
-def main() -> None:
-    manager = RecoveryManager()
-
-    manager.add_region(Region("ap-south-1", RegionState.PRIMARY))
-    manager.add_region(Region("ap-southeast-1", RegionState.SECONDARY))
-    manager.add_region(Region("eu-west-1", RegionState.PRIMARY))
-    manager.add_region(Region("eu-central-1", RegionState.SECONDARY))
-
-    manager.register_service(
-        Service(
-            name="payments",
-            objective=RecoveryObjective(rpo_minutes=5, rto_minutes=15),
-            tier=RecoveryTier.WARM_STANDBY,
-            data={"transaction-1001": "approved"},
-            running_regions=["ap-south-1", "ap-southeast-1"],
-        )
-    )
-
-    manager.register_service(
-        Service(
-            name="analytics",
-            objective=RecoveryObjective(rpo_minutes=30, rto_minutes=60),
-            tier=RecoveryTier.BACKUP_RESTORE,
-            data={"report-2026-10-21": "complete"},
-            running_regions=["eu-west-1", "eu-central-1"],
-        )
-    )
-
-    manager.register_service(
-        Service(
-            name="catalog",
-            objective=RecoveryObjective(rpo_minutes=1, rto_minutes=5),
-            tier=RecoveryTier.MULTI_REGION,
-            data={"sku-100": "active"},
-            running_regions=["ap-south-1", "ap-southeast-1"],
-        )
-    )
-
-    manager.record_write("payments", "transaction-1002", "pending")
-    simulate_failover(manager)
-
-    # Reset the region for the independent failure demonstration.
-    manager.regions["eu-west-1"].state = RegionState.PRIMARY
-    manager.regions["eu-central-1"].state = RegionState.SECONDARY
-
-    demonstrate_failed_recovery(manager)
-
-    # Demonstrate that a failed or missing recovery target is rejected.
-    manager.regions["eu-central-1"].state = RegionState.FAILED
-    try:
-        manager.recover(
-            "analytics",
-            "eu-west-1",
-            "eu-central-1",
-        )
-    except RuntimeError as exc:
-        print("\nExpected unavailable-target rejection:")
-        print(exc)
-
-
-if __name__ == "__main__":
-    main()
+main().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
