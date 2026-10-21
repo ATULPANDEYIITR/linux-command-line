@@ -1,404 +1,457 @@
-'use strict';
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-const crypto = require('node:crypto');
-const { EventEmitter } = require('node:events');
+enum class RecoveryTier {
+    BackupRestore,
+    PilotLight,
+    WarmStandby,
+    MultiRegion
+};
 
-const RecoveryTier = Object.freeze({
-  BACKUP_RESTORE: 'backup_restore',
-  PILOT_LIGHT: 'pilot_light',
-  WARM_STANDBY: 'warm_standby',
-  MULTI_REGION: 'multi_region'
-});
+enum class RegionState {
+    Primary,
+    Secondary,
+    Failed
+};
 
-const RegionState = Object.freeze({
-  PRIMARY: 'primary',
-  SECONDARY: 'secondary',
-  FAILED: 'failed'
-});
+struct RecoveryObjective {
+    int rpoMinutes;
+    int rtoMinutes;
 
-class RecoveryError extends Error {}
-
-class RecoveryPolicy {
-  constructor({ rpoMinutes, rtoMinutes, requiredApprovals = 1 }) {
-    if (!Number.isInteger(rpoMinutes) || rpoMinutes < 0) {
-      throw new TypeError('RPO must be a non-negative integer');
-    }
-
-    if (!Number.isInteger(rtoMinutes) || rtoMinutes <= 0) {
-      throw new TypeError('RTO must be a positive integer');
-    }
-
-    if (!Number.isInteger(requiredApprovals) || requiredApprovals < 1) {
-      throw new TypeError('requiredApprovals must be positive');
-    }
-
-    this.rpoMinutes = rpoMinutes;
-    this.rtoMinutes = rtoMinutes;
-    this.requiredApprovals = requiredApprovals;
-  }
-}
-
-class Backup {
-  constructor({ id, service, createdAt, payload, location }) {
-    this.id = id;
-    this.service = service;
-    this.createdAt = createdAt;
-    this.location = location;
-    this.payloadHash = crypto
-      .createHash('sha256')
-      .update(JSON.stringify(payload))
-      .digest('hex');
-  }
-
-  ageMinutes(now = Date.now()) {
-    return Math.max(0, (now - this.createdAt) / 60000);
-  }
-}
-
-class Region {
-  constructor(name, state = RegionState.SECONDARY, capacity = 100) {
-    if (!name || capacity < 0 || capacity > 100) {
-      throw new TypeError('Invalid region configuration');
-    }
-
-    this.name = name;
-    this.state = state;
-    this.capacity = capacity;
-  }
-
-  isAvailable() {
-    return this.state !== RegionState.FAILED && this.capacity > 0;
-  }
-}
-
-class Service {
-  constructor({ name, policy, tier, regions }) {
-    if (!name || !Object.values(RecoveryTier).includes(tier)) {
-      throw new TypeError('Invalid service definition');
-    }
-
-    if (!Array.isArray(regions) || regions.length === 0) {
-      throw new TypeError('A service requires at least one recovery region');
-    }
-
-    this.name = name;
-    this.policy = policy;
-    this.tier = tier;
-    this.regions = new Set(regions);
-    this.data = new Map();
-    this.backups = [];
-  }
-
-  write(key, value) {
-    if (!key || typeof value !== 'string') {
-      throw new TypeError('Invalid service data');
-    }
-
-    this.data.set(key, value);
-  }
-
-  createBackup(location = 'secondary-object-storage') {
-    const payload = Object.fromEntries(this.data.entries());
-
-    const backup = new Backup({
-      id: `${this.name}-backup-${this.backups.length + 1}`,
-      service: this.name,
-      createdAt: Date.now(),
-      payload,
-      location
-    });
-
-    this.backups.push(backup);
-    return backup;
-  }
-
-  latestBackup() {
-    return this.backups.at(-1) ?? null;
-  }
-}
-
-class RecoveryController extends EventEmitter {
-  constructor() {
-    super();
-    this.regions = new Map();
-    this.services = new Map();
-  }
-
-  addRegion(region) {
-    if (this.regions.has(region.name)) {
-      throw new RecoveryError(`Region already exists: ${region.name}`);
-    }
-
-    this.regions.set(region.name, region);
-  }
-
-  addService(service) {
-    for (const region of service.regions) {
-      if (!this.regions.has(region)) {
-        throw new RecoveryError(
-          `Service ${service.name} references unknown region ${region}`
-        );
-      }
-    }
-
-    this.services.set(service.name, service);
-  }
-
-  failRegion(regionName) {
-    const region = this.getRegion(regionName);
-    region.state = RegionState.FAILED;
-
-    this.emit('regionFailed', {
-      region: regionName,
-      timestamp: new Date().toISOString()
-    });
-  }
-
-  evaluate(serviceName, failedRegion, targetRegion) {
-    const service = this.getService(serviceName);
-    const failed = this.getRegion(failedRegion);
-    const target = this.getRegion(targetRegion);
-
-    const backup = service.latestBackup();
-
-    const checks = {
-      targetConfigured: service.regions.has(targetRegion),
-      targetAvailable: target.isAvailable(),
-      failed: failed.state === RegionState.FAILED,
-      backupAvailable: backup !== null,
-      rpoMet: false,
-      rtoMet: false,
-      tierSupported: false
-    };
-
-    const recoveryMinutes = {
-      [RecoveryTier.BACKUP_RESTORE]: 90,
-      [RecoveryTier.PILOT_LIGHT]: 30,
-      [RecoveryTier.WARM_STANDBY]: 10,
-      [RecoveryTier.MULTI_REGION]: 2
-    }[service.tier];
-
-    checks.rtoMet = recoveryMinutes <= service.policy.rtoMinutes;
-
-    if (backup) {
-      checks.rpoMet =
-        backup.ageMinutes() <= service.policy.rpoMinutes;
-    }
-
-    checks.tierSupported =
-      service.tier === RecoveryTier.BACKUP_RESTORE
-        ? checks.backupAvailable
-        : checks.targetConfigured;
-
-    const eligible = Object.values(checks).every(Boolean);
-
-    return {
-      service: service.name,
-      failedRegion,
-      targetRegion,
-      tier: service.tier,
-      checks,
-      recoveryMinutes,
-      backupAgeMinutes: backup
-        ? Number(backup.ageMinutes().toFixed(2))
-        : null,
-      eligible
-    };
-  }
-
-  recover(serviceName, failedRegion, targetRegion) {
-    const evaluation = this.evaluate(
-      serviceName,
-      failedRegion,
-      targetRegion
-    );
-
-    if (!evaluation.eligible) {
-      throw new RecoveryError(
-        `Recovery rejected: ${JSON.stringify(evaluation.checks)}`
-      );
-    }
-
-    this.getRegion(targetRegion).state = RegionState.PRIMARY;
-
-    this.emit('failoverCompleted', {
-      service: serviceName,
-      from: failedRegion,
-      to: targetRegion,
-      at: new Date().toISOString()
-    });
-
-    return evaluation;
-  }
-
-  audit() {
-    const findings = [];
-
-    for (const service of this.services.values()) {
-      const backup = service.latestBackup();
-
-      if (!backup) {
-        findings.push(`${service.name}: no backup`);
-        continue;
-      }
-
-      if (backup.ageMinutes() > service.policy.rpoMinutes) {
-        findings.push(
-          `${service.name}: backup age exceeds RPO`
-        );
-      }
-
-      if (service.tier === RecoveryTier.MULTI_REGION) {
-        const available = [...service.regions]
-          .map(name => this.getRegion(name))
-          .filter(region => region.isAvailable());
-
-        if (available.length < 2) {
-          findings.push(
-            `${service.name}: insufficient available regions`
-          );
+    void validate() const {
+        if (rpoMinutes < 0) {
+            throw std::invalid_argument("RPO cannot be negative");
         }
-      }
+        if (rtoMinutes <= 0) {
+            throw std::invalid_argument("RTO must be positive");
+        }
+    }
+};
+
+struct StatusCheck {
+    std::string name;
+    bool passed;
+};
+
+struct ReviewDecision {
+    std::string reviewer;
+    bool eligible;
+    bool approved;
+};
+
+struct Backup {
+    std::string id;
+    long long createdEpochMinutes;
+    bool verified;
+};
+
+struct PullRequestRecoveryRecord {
+    std::string service;
+    RecoveryTier tier;
+    RecoveryObjective objective;
+    std::string primaryRegion;
+    std::set<std::string> recoveryRegions;
+    std::vector<StatusCheck> statusChecks;
+    std::vector<ReviewDecision> approvals;
+    std::vector<Backup> backups;
+};
+
+struct Region {
+    std::string name;
+    RegionState state;
+    int capacityPercent;
+
+    bool available() const {
+        return state != RegionState::Failed && capacityPercent > 0;
+    }
+};
+
+struct Evaluation {
+    bool primaryFailed;
+    bool targetAvailable;
+    bool targetConfigured;
+    bool backupAvailable;
+    bool rpoMet;
+    bool rtoMet;
+    bool statusChecksPassed;
+    bool approvalsSatisfied;
+    int estimatedRto;
+    int estimatedRpo;
+
+    bool eligible() const {
+        return primaryFailed &&
+               targetAvailable &&
+               targetConfigured &&
+               backupAvailable &&
+               rpoMet &&
+               rtoMet &&
+               statusChecksPassed &&
+               approvalsSatisfied;
+    }
+};
+
+class GovernanceEngine {
+private:
+    std::map<std::string, Region> regions_;
+
+    static int recoveryTime(RecoveryTier tier) {
+        switch (tier) {
+            case RecoveryTier::BackupRestore:
+                return 90;
+            case RecoveryTier::PilotLight:
+                return 30;
+            case RecoveryTier::WarmStandby:
+                return 10;
+            case RecoveryTier::MultiRegion:
+                return 2;
+        }
+
+        throw std::logic_error("Unknown recovery tier");
     }
 
-    return findings;
-  }
+    static bool isRpoSatisfied(
+        const PullRequestRecoveryRecord& service,
+        long long nowMinutes,
+        int& age
+    ) {
+        if (service.backups.empty()) {
+            age = 0;
+            return false;
+        }
 
-  getService(name) {
-    const service = this.services.get(name);
-    if (!service) {
-      throw new RecoveryError(`Unknown service: ${name}`);
+        const Backup& latest = service.backups.back();
+
+        if (!latest.verified) {
+            age = 0;
+            return false;
+        }
+
+        age = static_cast<int>(
+            std::max(0LL, nowMinutes - latest.createdEpochMinutes)
+        );
+
+        return age <= service.objective.rpoMinutes;
     }
-    return service;
-  }
 
-  getRegion(name) {
-    const region = this.regions.get(name);
-    if (!region) {
-      throw new RecoveryError(`Unknown region: ${name}`);
+public:
+    void addRegion(Region region) {
+        if (region.capacityPercent < 0 ||
+            region.capacityPercent > 100) {
+            throw std::invalid_argument("Invalid region capacity");
+        }
+
+        if (regions_.contains(region.name)) {
+            throw std::invalid_argument("Duplicate region");
+        }
+
+        regions_.emplace(region.name, std::move(region));
     }
-    return region;
-  }
+
+    void failRegion(const std::string& name) {
+        auto it = regions_.find(name);
+
+        if (it == regions_.end()) {
+            throw std::out_of_range("Unknown region");
+        }
+
+        it->second.state = RegionState::Failed;
+    }
+
+    Evaluation evaluate(
+        const PullRequestRecoveryRecord& service,
+        const std::string& targetRegion,
+        long long nowMinutes
+    ) const {
+        service.objective.validate();
+
+        auto primary = regions_.find(service.primaryRegion);
+        auto target = regions_.find(targetRegion);
+
+        if (primary == regions_.end()) {
+            throw std::out_of_range("Unknown primary region");
+        }
+
+        if (target == regions_.end()) {
+            throw std::out_of_range("Unknown target region");
+        }
+
+        int backupAge = 0;
+
+        bool rpoMet = isRpoSatisfied(
+            service,
+            nowMinutes,
+            backupAge
+        );
+
+        bool statusChecksPassed = std::all_of(
+            service.statusChecks.begin(),
+            service.statusChecks.end(),
+            [](const StatusCheck& check) {
+                return check.passed;
+            }
+        );
+
+        int eligibleApprovals = 0;
+
+        for (const auto& approval : service.approvals) {
+            if (approval.eligible && approval.approved) {
+                ++eligibleApprovals;
+            }
+        }
+
+        bool approvalsSatisfied = eligibleApprovals >= 2;
+
+        int estimatedRto = recoveryTime(service.tier);
+
+        return Evaluation{
+            .primaryFailed =
+                primary->second.state == RegionState::Failed,
+            .targetAvailable =
+                target->second.available(),
+            .targetConfigured =
+                service.recoveryRegions.contains(targetRegion),
+            .backupAvailable =
+                !service.backups.empty(),
+            .rpoMet = rpoMet,
+            .rtoMet =
+                estimatedRto <= service.objective.rtoMinutes,
+            .statusChecksPassed = statusChecksPassed,
+            .approvalsSatisfied = approvalsSatisfied,
+            .estimatedRto = estimatedRto,
+            .estimatedRpo = backupAge
+        };
+    }
+
+    void printEvaluation(
+        const Evaluation& evaluation
+    ) const {
+        std::cout << "Recovery eligibility\n"
+                  << "  primary failed: "
+                  << std::boolalpha
+                  << evaluation.primaryFailed << '\n'
+                  << "  target available: "
+                  << evaluation.targetAvailable << '\n'
+                  << "  target configured: "
+                  << evaluation.targetConfigured << '\n'
+                  << "  backup available: "
+                  << evaluation.backupAvailable << '\n'
+                  << "  RPO satisfied: "
+                  << evaluation.rpoMet
+                  << " (" << evaluation.estimatedRpo
+                  << " minutes)\n"
+                  << "  RTO satisfied: "
+                  << evaluation.rtoMet
+                  << " (" << evaluation.estimatedRto
+                  << " minutes)\n"
+                  << "  status checks passed: "
+                  << evaluation.statusChecksPassed << '\n'
+                  << "  approvals satisfied: "
+                  << evaluation.approvalsSatisfied << '\n'
+                  << "  FINAL ELIGIBILITY: "
+                  << evaluation.eligible() << "\n\n";
+    }
+
+    void executeFailover(
+        PullRequestRecoveryRecord& service,
+        const std::string& targetRegion,
+        long long nowMinutes
+    ) {
+        Evaluation evaluation =
+            evaluate(service, targetRegion, nowMinutes);
+
+        printEvaluation(evaluation);
+
+        if (!evaluation.eligible()) {
+            throw std::runtime_error(
+                "Failover rejected because recovery policy "
+                "conditions are not satisfied"
+            );
+        }
+
+        regions_.at(service.primaryRegion).state =
+            RegionState::Failed;
+
+        regions_.at(targetRegion).state =
+            RegionState::Primary;
+
+        service.primaryRegion = targetRegion;
+
+        std::cout
+            << "Failover completed successfully: "
+            << service.service
+            << " -> "
+            << targetRegion
+            << "\n\n";
+    }
+};
+
+int main() {
+    try {
+        GovernanceEngine engine;
+
+        engine.addRegion({
+            "ap-south-1",
+            RegionState::Primary,
+            100
+        });
+
+        engine.addRegion({
+            "ap-southeast-1",
+            RegionState::Secondary,
+            100
+        });
+
+        engine.addRegion({
+            "eu-west-1",
+            RegionState::Primary,
+            100
+        });
+
+        engine.addRegion({
+            "eu-central-1",
+            RegionState::Secondary,
+            100
+        });
+
+        const long long nowMinutes =
+            std::chrono::duration_cast<std::chrono::minutes>(
+                std::chrono::system_clock::now()
+                    .time_since_epoch()
+            ).count();
+
+        PullRequestRecoveryRecord payments{
+            .service = "payments",
+            .tier = RecoveryTier::WarmStandby,
+            .objective = {5, 15},
+            .primaryRegion = "ap-south-1",
+            .recoveryRegions = {
+                "ap-south-1",
+                "ap-southeast-1"
+            },
+            .statusChecks = {
+                {"backup-integrity", true},
+                {"replication-health", true},
+                {"security-validation", true}
+            },
+            .approvals = {
+                {"platform-owner", true, true},
+                {"security-owner", true, true},
+                {"temporary-reviewer", false, true}
+            },
+            .backups = {
+                {
+                    "payments-backup-001",
+                    nowMinutes - 2,
+                    true
+                }
+            }
+        };
+
+        engine.failRegion("ap-south-1");
+
+        engine.executeFailover(
+            payments,
+            "ap-southeast-1",
+            nowMinutes
+        );
+
+        PullRequestRecoveryRecord analytics{
+            .service = "analytics",
+            .tier = RecoveryTier::BackupRestore,
+            .objective = {30, 60},
+            .primaryRegion = "eu-west-1",
+            .recoveryRegions = {
+                "eu-west-1",
+                "eu-central-1"
+            },
+            .statusChecks = {
+                {"backup-integrity", true},
+                {"replication-health", true}
+            },
+            .approvals = {
+                {"analytics-owner", true, true},
+                {"security-owner", true, false}
+            },
+            .backups = {
+                {
+                    "analytics-backup-001",
+                    nowMinutes - 45,
+                    true
+                }
+            }
+        };
+
+        engine.failRegion("eu-west-1");
+
+        try {
+            engine.executeFailover(
+                analytics,
+                "eu-central-1",
+                nowMinutes
+            );
+        } catch (const std::exception& error) {
+            std::cout
+                << "Expected analytics rejection: "
+                << error.what()
+                << "\n\n";
+        }
+
+        // A failed recovery target demonstrates that a configured
+        // secondary is not necessarily an available recovery target.
+        PullRequestRecoveryRecord catalog{
+            .service = "catalog",
+            .tier = RecoveryTier::MultiRegion,
+            .objective = {1, 5},
+            .primaryRegion = "ap-southeast-1",
+            .recoveryRegions = {
+                "ap-southeast-1",
+                "ap-south-1"
+            },
+            .statusChecks = {
+                {"replication-health", true}
+            },
+            .approvals = {
+                {"platform-owner", true, true},
+                {"security-owner", true, true}
+            },
+            .backups = {
+                {
+                    "catalog-backup-001",
+                    nowMinutes,
+                    true
+                }
+            }
+        };
+
+        engine.failRegion("ap-southeast-1");
+
+        try {
+            engine.executeFailover(
+                catalog,
+                "ap-south-1",
+                nowMinutes
+            );
+        } catch (const std::exception& error) {
+            std::cout
+                << "Expected target rejection: "
+                << error.what()
+                << '\n';
+        }
+    } catch (const std::exception& error) {
+        std::cerr
+            << "Fatal configuration error: "
+            << error.what()
+            << '\n';
+        return 1;
+    }
+
+    return 0;
 }
-
-async function waitForHealthCheck(region) {
-  // Event-driven recovery systems normally wait for an external health signal.
-  // This deterministic simulation uses a short asynchronous delay.
-  await new Promise(resolve => setTimeout(resolve, 25));
-  return region.isAvailable();
-}
-
-async function main() {
-  const controller = new RecoveryController();
-
-  controller.on('regionFailed', event => {
-    console.log(`EVENT regionFailed: ${event.region}`);
-  });
-
-  controller.on('failoverCompleted', event => {
-    console.log(
-      `EVENT failoverCompleted: ${event.service} ${event.from} -> ${event.to}`
-    );
-  });
-
-  controller.addRegion(
-    new Region('ap-south-1', RegionState.PRIMARY)
-  );
-  controller.addRegion(
-    new Region('ap-southeast-1', RegionState.SECONDARY)
-  );
-  controller.addRegion(
-    new Region('eu-west-1', RegionState.PRIMARY)
-  );
-  controller.addRegion(
-    new Region('eu-central-1', RegionState.SECONDARY)
-  );
-
-  const payments = new Service({
-    name: 'payments',
-    policy: new RecoveryPolicy({
-      rpoMinutes: 5,
-      rtoMinutes: 15
-    }),
-    tier: RecoveryTier.WARM_STANDBY,
-    regions: ['ap-south-1', 'ap-southeast-1']
-  });
-
-  payments.write('transaction-1001', 'approved');
-  payments.createBackup();
-
-  const analytics = new Service({
-    name: 'analytics',
-    policy: new RecoveryPolicy({
-      rpoMinutes: 30,
-      rtoMinutes: 60
-    }),
-    tier: RecoveryTier.BACKUP_RESTORE,
-    regions: ['eu-west-1', 'eu-central-1']
-  });
-
-  analytics.write('report-2026-10-21', 'complete');
-  const analyticsBackup = analytics.createBackup();
-
-  // Simulate an old backup so the RPO rule fails.
-  analyticsBackup.createdAt = Date.now() - 45 * 60000;
-
-  controller.addService(payments);
-  controller.addService(analytics);
-
-  const target = controller.getRegion('ap-southeast-1');
-  console.log(
-    `Target health: ${await waitForHealthCheck(target)}`
-  );
-
-  controller.failRegion('ap-south-1');
-
-  try {
-    const result = controller.recover(
-      'payments',
-      'ap-south-1',
-      'ap-southeast-1'
-    );
-
-    console.log(
-      JSON.stringify(result, null, 2)
-    );
-  } catch (error) {
-    console.error(`Unexpected recovery failure: ${error.message}`);
-  }
-
-  controller.failRegion('eu-west-1');
-
-  try {
-    controller.recover(
-      'analytics',
-      'eu-west-1',
-      'eu-central-1'
-    );
-  } catch (error) {
-    console.log(`Expected rejection: ${error.message}`);
-  }
-
-  console.log('\nRecovery audit:');
-  console.log(controller.audit());
-
-  // A target with zero capacity must never be selected for failover.
-  controller.getRegion('ap-southeast-1').capacity = 0;
-
-  try {
-    controller.recover(
-      'payments',
-      'ap-south-1',
-      'ap-southeast-1'
-    );
-  } catch (error) {
-    console.log(
-      `Expected capacity rejection: ${error.message}`
-    );
-  }
-}
-
-main().catch(error => {
-  console.error(error);
-  process.exitCode = 1;
-});
