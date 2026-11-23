@@ -32,7 +32,6 @@ A container image consists of multiple filesystem layers and image configuration
 
 A simplified architecture is:
 
-```text
 Container Image
     |
     +-- Base Image
@@ -97,7 +96,7 @@ Image scanning examines container images for known vulnerabilities, insecure con
 
 A typical scanning workflow is:
 
-```
+
 Image Build
     |
     v
@@ -125,7 +124,6 @@ Approved                Blocked
     |                      |
     v                      v
 Deployment             Remediation
-```
 
 The Python, JavaScript, C++17, and Java 17 implementations use separate scanner components for different finding categories.
 
@@ -204,7 +202,6 @@ The PostgreSQL implementation models this inventory through `image_packages`.
 
 The relational structure is:
 
-```
 container_images
        |
        +---- image_packages
@@ -283,7 +280,7 @@ RUNTIME STAGE
     +-- Required Runtime Libraries
     +-- Non-root User
     +-- Entrypoint
-```
+
 
 This approach reduces the number of unnecessary tools included in the production image.
 
